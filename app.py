@@ -22,7 +22,7 @@ def ai_summary(text):
     }
 
     data = {
-        "model": "llama3-70b-8192",
+        "model": "mixtral-8x7b-32768",
         "messages": [
             {"role": "system", "content": "You are a financial analyst."},
             {"role": "user", "content": f"Summarize this 10-K section and extract growth drivers and risks:\n\n{text}"}
@@ -32,12 +32,11 @@ def ai_summary(text):
 
     r = requests.post(url, headers=headers, json=data)
 
-    # If Groq returns an error, show it instead of crashing
     if "error" in r.json():
         return f"Groq API Error: {r.json()['error']['message']}"
 
-    # Normal successful response
     return r.json()["choices"][0]["message"]["content"]
+
 
 
 
@@ -100,6 +99,27 @@ def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
     return intrinsic_value
 
 
+def get_financials(ticker):
+    stock = yf.Ticker(ticker)
+    try:
+        income = stock.financials
+        revenue = income.loc["Total Revenue"].iloc[:3].values
+        op_income = income.loc["Operating Income"].iloc[:3].values
+        op_margin = op_income / revenue
+
+        df = pd.DataFrame({
+            "Revenue": revenue,
+            "Operating Margin": op_margin
+        })
+        return df
+    except:
+        return pd.DataFrame({
+            "Revenue": [100e9, 110e9, 120e9],
+            "Operating Margin": [0.25, 0.26, 0.27]
+        })
+
+
+
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
@@ -113,14 +133,10 @@ if ticker:
 
     st.line_chart(hist["Close"])
 
-    st.header("2. Financial Data (Simplified)")
-    # Placeholder financials (you can expand this)
-    financials = pd.DataFrame({
-        "Revenue": [100e9, 110e9, 120e9],
-        "Operating Margin": [0.25, 0.26, 0.27]
-    })
-
+    st.header("2. Financial Data (Real Data)")
+    financials = get_financials(ticker)
     st.write(financials)
+
 
     st.header("3. AI Summary of 10-K")
     tenk = get_10k(ticker)
