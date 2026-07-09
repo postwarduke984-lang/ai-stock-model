@@ -11,7 +11,7 @@ import json
 # -----------------------------
 import requests
 
-GROQ_API_KEY = "YOUR_GROQ_API_KEY"   # free key from console.groq.com
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 def ai_summary(text):
     url = "https://api.groq.com/openai/v1/chat/completions"
