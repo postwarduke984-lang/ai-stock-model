@@ -13,9 +13,14 @@ import requests
 
 GROQ_API_KEY = "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"
 
+
 def ai_summary(text):
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     data = {
         "model": "llama3-70b-8192",
         "messages": [
@@ -24,8 +29,16 @@ def ai_summary(text):
         ],
         "temperature": 0.2
     }
+
     r = requests.post(url, headers=headers, json=data)
+
+    # If Groq returns an error, show it instead of crashing
+    if "error" in r.json():
+        return f"Groq API Error: {r.json()['error']['message']}"
+
+    # Normal successful response
     return r.json()["choices"][0]["message"]["content"]
+
 
 
 # -----------------------------
