@@ -45,7 +45,7 @@ def ai_summary(text):
 # -----------------------------
 
 def get_cik_from_ticker(ticker):
-    url = "https://www.sec.gov/files/company_tickers.json"
+    url = f"https://www.sec.gov/cgi-bin/browse-edgar?CIK={ticker}&action=getcompany&output=json"
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json"
@@ -53,19 +53,16 @@ def get_cik_from_ticker(ticker):
 
     r = requests.get(url, headers=headers)
 
-    # SAFE JSON PARSE
     try:
         data = r.json()
-    except Exception:
-        return None   # SEC returned HTML or rate-limit page
+    except:
+        return None
 
-    ticker = ticker.upper()
-    for entry in data.values():
-        if entry["ticker"].upper() == ticker:
-            cik_str = str(entry["cik_str"])
-            return cik_str.zfill(10)
-
-    return None
+    try:
+        cik = data["company"]["cik"]
+        return str(cik).zfill(10)
+    except:
+        return None
 
 
 def get_10k(ticker):
@@ -76,15 +73,14 @@ def get_10k(ticker):
 
     cik = get_cik_from_ticker(ticker)
     if cik is None:
-        return "SEC rate-limited or CIK not found. Try again in 30 seconds."
+        return "Could not find CIK for this ticker."
 
     subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     r = requests.get(subs_url, headers=headers)
 
-    # SAFE JSON PARSE
     try:
         data = r.json()
-    except Exception:
+    except:
         return "SEC returned non-JSON (rate limit). Try again shortly."
 
     recent = data.get("filings", {}).get("recent", {})
@@ -101,7 +97,7 @@ def get_10k(ticker):
             doc_resp = requests.get(doc_url, headers=headers)
 
             text = doc_resp.text
-            return text[:20000]
+            return text[:20000]  # safe chunk for AI
 
     return "No 10-K filing found for this ticker."
 
