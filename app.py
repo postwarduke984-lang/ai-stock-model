@@ -68,36 +68,14 @@ def get_cik_from_ticker(ticker):
 
 
 def get_10k(ticker):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json"
-    }
+    ticker = ticker.upper()
+    filepath = f"10k_filings/{ticker}.txt"
 
-    cik = get_cik_from_ticker(ticker)
-    if cik is None:
-        return f"Could not find CIK for ticker {ticker}. Try again later."
-
-    subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
-        r = requests.get(subs_url, headers=headers)
-        data = r.json()
-    except Exception:
-        return "SEC returned non‑JSON (rate limit). Try again shortly."
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    accessions = recent.get("accessionNumber", [])
-    primaries = recent.get("primaryDocument", [])
-
-    for i, form in enumerate(forms):
-        if form == "10-K":
-            accession = accessions[i].replace("-", "")
-            primary_doc = primaries[i]
-            doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
-            doc_resp = requests.get(doc_url, headers=headers)
-            return doc_resp.text[:20000]
-
-    return "No 10‑K filing found for this ticker."
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
+    except:
+        return f"No local 10-K file found for {ticker}."
 
 
 
