@@ -22,7 +22,7 @@ def ai_summary(text):
     }
 
     data = {
-        "model": "mixtral-8x7b-32768",
+        "model": "llama-3.1-70b-versatile",
         "messages": [
             {"role": "system", "content": "You are a financial analyst."},
             {"role": "user", "content": f"Summarize this 10-K section and extract growth drivers and risks:\n\n{text}"}
