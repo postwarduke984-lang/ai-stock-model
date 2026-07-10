@@ -45,24 +45,28 @@ def ai_summary(text):
 # -----------------------------
 
 def get_cik_from_ticker(ticker):
-    url = f"https://www.sec.gov/cgi-bin/browse-edgar?CIK={ticker}&action=getcompany&output=json"
+    url = "https://www.sec.gov/files/company_tickers.json"
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json"
     }
 
-    r = requests.get(url, headers=headers)
-
     try:
+        r = requests.get(url, headers=headers)
         data = r.json()
     except:
         return None
 
-    try:
-        cik = data["company"]["cik"]
-        return str(cik).zfill(10)
-    except:
-        return None
+    ticker = ticker.upper()
+
+    # company_tickers.json is structured as {0: {...}, 1: {...}, ...}
+    for entry in data.values():
+        if entry["ticker"].upper() == ticker:
+            cik = str(entry["cik_str"])
+            return cik.zfill(10)
+
+    return None
+
 
 
 def get_10k(ticker):
@@ -76,9 +80,9 @@ def get_10k(ticker):
         return "Could not find CIK for this ticker."
 
     subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    r = requests.get(subs_url, headers=headers)
 
     try:
+        r = requests.get(subs_url, headers=headers)
         data = r.json()
     except:
         return "SEC returned non-JSON (rate limit). Try again shortly."
@@ -96,12 +100,9 @@ def get_10k(ticker):
             doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
             doc_resp = requests.get(doc_url, headers=headers)
 
-            text = doc_resp.text
-            return text[:20000]  # safe chunk for AI
+            return doc_resp.text[:20000]
 
     return "No 10-K filing found for this ticker."
-
-
 
 
 # -----------------------------
