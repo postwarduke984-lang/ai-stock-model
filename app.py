@@ -54,12 +54,10 @@ def get_cik_from_ticker(ticker):
     try:
         r = requests.get(url, headers=headers)
         data = r.json()
-    except:
+    except Exception:
         return None
 
     ticker = ticker.upper()
-
-    # company_tickers.json is structured as {0: {...}, 1: {...}, ...}
     for entry in data.values():
         if entry["ticker"].upper() == ticker:
             cik = str(entry["cik_str"])
@@ -77,15 +75,14 @@ def get_10k(ticker):
 
     cik = get_cik_from_ticker(ticker)
     if cik is None:
-        return "Could not find CIK for this ticker."
+        return f"Could not find CIK for ticker {ticker}. Try again later."
 
     subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-
     try:
         r = requests.get(subs_url, headers=headers)
         data = r.json()
-    except:
-        return "SEC returned non-JSON (rate limit). Try again shortly."
+    except Exception:
+        return "SEC returned non‑JSON (rate limit). Try again shortly."
 
     recent = data.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
@@ -96,13 +93,12 @@ def get_10k(ticker):
         if form == "10-K":
             accession = accessions[i].replace("-", "")
             primary_doc = primaries[i]
-
             doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
             doc_resp = requests.get(doc_url, headers=headers)
-
             return doc_resp.text[:20000]
 
-    return "No 10-K filing found for this ticker."
+    return "No 10‑K filing found for this ticker."
+
 
 
 # -----------------------------
