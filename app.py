@@ -101,22 +101,17 @@ def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
 
 def get_financials(ticker):
     stock = yf.Ticker(ticker)
-
     try:
         income = stock.financials
 
-        # Ensure financials exist
         if income is None or income.empty:
             raise ValueError("No financial data found")
 
-        # Ensure required rows exist
         if "Total Revenue" not in income.index or "Operating Income" not in income.index:
             raise ValueError("Missing required financial fields")
 
         revenue = income.loc["Total Revenue"].iloc[:3].values
         op_income = income.loc["Operating Income"].iloc[:3].values
-
-        # Avoid division errors
         op_margin = np.divide(op_income, revenue, out=np.zeros_like(op_income), where=revenue!=0)
 
         df = pd.DataFrame({
@@ -126,7 +121,7 @@ def get_financials(ticker):
         return df
 
     except Exception as e:
-        # Fallback values if anything fails
+        st.warning(f"Financial data unavailable: {e}")
         return pd.DataFrame({
             "Revenue": [100e9, 110e9, 120e9],
             "Operating Margin": [0.25, 0.26, 0.27]
