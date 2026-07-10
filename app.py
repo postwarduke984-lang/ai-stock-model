@@ -43,10 +43,60 @@ def ai_summary(text):
 # -----------------------------
 # SEC 10-K FETCHER (FREE)
 # -----------------------------
+
+def get_cik_from_ticker(ticker):
+    url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    r = requests.get(url, headers=headers)
+    data = r.json()
+
+    ticker = ticker.upper()
+    for entry in data.values():
+        if entry["ticker"].upper() == ticker:
+            cik_str = str(entry["cik_str"])
+            return cik_str.zfill(10)  # SEC requires 10-digit CIK
+
+    raise ValueError(f"CIK not found for ticker {ticker}")
+
+
 def get_10k(ticker):
-    cik_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{ticker}.json"
-    # For simplicity, use a placeholder (real EDGAR parsing is longer)
-    return "10-K text placeholder for demo. Replace with EDGAR fetcher."
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    # 1) Convert ticker → CIK
+    cik = get_cik_from_ticker(ticker)
+
+    # 2) Get all filings for this company
+    subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    r = requests.get(subs_url, headers=headers)
+    data = r.json()
+
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    accessions = recent.get("accessionNumber", [])
+    primaries = recent.get("primaryDocument", [])
+
+    # 3) Find the latest 10-K
+    for i, form in enumerate(forms):
+        if form == "10-K":
+            accession = accessions[i].replace("-", "")
+            primary_doc = primaries[i]
+
+            # 4) Download the actual filing document
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
+            doc_resp = requests.get(doc_url, headers=headers)
+
+            text = doc_resp.text
+
+            # 5) Trim to avoid sending 300k+ characters to Groq
+            return text[:20000]
+
+    return "No 10-K filing found for this ticker."
+
 
 
 # -----------------------------
