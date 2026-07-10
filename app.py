@@ -180,6 +180,77 @@ def get_financials(ticker):
         })
 
 
+
+# -----------------------------
+# SEC 10-K FETCHER (REAL + FALLBACK)
+# -----------------------------
+def get_10k(ticker):
+    import requests
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+    }
+
+    # Local fallback for common tickers (never fails)
+    fallback_ciks = {
+        "AAPL": "0000320193",
+        "MSFT": "0000789019",
+        "GOOGL": "0001652044",
+        "AMZN": "0001018724",
+        "TSLA": "0001318605",
+        "META": "0001326801",
+        "NVDA": "0001045810",
+        "NFLX": "0001065280",
+        "INTC": "0000050863",
+        "AMD": "0000002488"
+    }
+
+    ticker = ticker.upper()
+    cik = fallback_ciks.get(ticker)
+
+    # Try live lookup if not in fallback
+    if cik is None:
+        try:
+            url = "https://www.sec.gov/files/company_tickers.json"
+            r = requests.get(url, headers=headers)
+            data = r.json()
+            for entry in data.values():
+                if entry["ticker"].upper() == ticker:
+                    cik = str(entry["cik_str"]).zfill(10)
+                    break
+        except Exception:
+            cik = None
+
+    if cik is None:
+        return f"Could not find CIK for ticker {ticker}. Try again later."
+
+    # Fetch filings for this CIK
+    subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    try:
+        r = requests.get(subs_url, headers=headers)
+        data = r.json()
+    except Exception:
+        return "SEC returned non‑JSON (rate limit). Try again shortly."
+
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    accessions = recent.get("accessionNumber", [])
+    primaries = recent.get("primaryDocument", [])
+
+    for i, form in enumerate(forms):
+        if form == "10-K":
+            accession = accessions[i].replace("-", "")
+            primary_doc = primaries[i]
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
+            doc_resp = requests.get(doc_url, headers=headers)
+            text = doc_resp.text
+            return text[:20000]  # first 20k chars for AI summary
+
+    return "No 10‑K filing found for this ticker."
+
+
+
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
