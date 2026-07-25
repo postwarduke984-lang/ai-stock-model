@@ -459,6 +459,63 @@ def run_dcf_per_share(forecast, shares0, buyback_rate, discount_rate=0.10, termi
     return price, shares_by_year
 
 
+@st.cache_data(ttl=60 * 60 * 3)
+def get_market_context(ticker):
+    """
+    Pulls analyst consensus, valuation multiples, and recent news headlines
+    from Yahoo Finance so the analyst report can weigh more than just the
+    DCF number. Returns a dict; any field we can't find is left as None
+    so downstream formatting can show 'N/A' consistently.
+    """
+    stock = yf.Ticker(ticker)
+    info = stock.info or {}
+
+    context = {
+        "target_mean_price": info.get("targetMeanPrice"),
+        "target_high_price": info.get("targetHighPrice"),
+        "target_low_price": info.get("targetLowPrice"),
+        "num_analysts": info.get("numberOfAnalystOpinions"),
+        "recommendation_key": info.get("recommendationKey"),  # e.g. 'buy', 'hold', 'sell'
+        "trailing_pe": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "peg_ratio": info.get("trailingPegRatio"),
+        "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+        "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+        "beta": info.get("beta"),
+        "news": [],
+    }
+
+    # Momentum: % change over the last ~1 and ~3 months of trading history.
+    try:
+        hist = stock.history(period="6mo")
+        closes = hist["Close"].dropna()
+        if len(closes) > 21:
+            context["momentum_1mo"] = float(closes.iloc[-1] / closes.iloc[-21] - 1)
+        if len(closes) > 63:
+            context["momentum_3mo"] = float(closes.iloc[-1] / closes.iloc[-63] - 1)
+    except Exception:
+        pass
+
+    # Recent news headlines — titles/publishers only (short factual metadata,
+    # not article text), just enough to give the model a sense of current
+    # narrative and sentiment without reproducing any copyrighted content.
+    try:
+        raw_news = stock.news or []
+        for item in raw_news[:6]:
+            content = item.get("content", item)  # yfinance news schema varies by version
+            title = content.get("title") if isinstance(content, dict) else None
+            publisher = None
+            if isinstance(content, dict):
+                provider = content.get("provider")
+                publisher = provider.get("displayName") if isinstance(provider, dict) else None
+            if title:
+                context["news"].append({"title": title, "publisher": publisher or "Unknown source"})
+    except Exception:
+        pass
+
+    return context
+
+
 # -----------------------------
 # FIXED-TEMPLATE 10-K NARRATIVE
 # -----------------------------
@@ -496,6 +553,77 @@ def build_qualitative_summary(sections, full_text_fallback):
         combined = "\n\n".join(parts)[:16000]
 
     return ai_summary(combined, QUALITATIVE_TEMPLATE)
+
+
+# -----------------------------
+# FIXED-TEMPLATE ANALYST REPORT (buy/hold/sell weighing multiple signals)
+# -----------------------------
+ANALYST_TEMPLATE = """
+You are writing a balanced equity research note. Use ALL the signals provided below —
+not just the DCF valuation — to reach a verdict. The DCF is one input among several;
+a stock trading above its DCF value can still reasonably be a Hold or even a Buy if
+analyst consensus, momentum, and qualitative factors support it, and vice versa.
+Weigh disagreements between signals explicitly rather than defaulting to whichever
+signal is most extreme.
+
+Fill in this exact template, keeping the section headers identical for every company.
+If a data point is marked N/A or missing below, say so plainly rather than guessing:
+
+**Verdict: [Buy / Hold / Sell]**
+
+**DCF valuation vs. market price:** (state the gap and how much weight it deserves)
+
+**Analyst consensus:** (target price range, number of analysts, consensus rating —
+note if this agrees or disagrees with the DCF)
+
+**Valuation multiples:** (trailing/forward P/E, PEG if available — cheap, fair, or
+expensive relative to what the multiple implies about growth expectations)
+
+**Price momentum:** (1-month and 3-month trend — supportive or a warning sign)
+
+**Recent news themes:** (based on the headlines provided — 1-2 sentences on what's
+currently driving sentiment, without inventing details beyond the headlines)
+
+**Bottom line:** (2-3 sentences synthesizing the above into the final call)
+
+Data:
+"""
+
+
+def build_analyst_report(ticker, forecast, price_estimate, current_price, market_context):
+    def fmt_pct(x):
+        return f"{x:.1%}" if x is not None else "N/A"
+
+    def fmt_num(x, prefix="$"):
+        return f"{prefix}{x:,.2f}" if x is not None else "N/A"
+
+    news_lines = "\n".join(
+        f"- \"{n['title']}\" ({n['publisher']})" for n in market_context.get("news", [])
+    ) or "No recent headlines available."
+
+    data_block = f"""
+DCF intrinsic value/share: {fmt_num(price_estimate)}
+Current market price: {fmt_num(current_price)}
+Implied gap: {fmt_pct((price_estimate / current_price - 1) if price_estimate and current_price else None)}
+
+Analyst target price (mean): {fmt_num(market_context.get('target_mean_price'))}
+Analyst target range: {fmt_num(market_context.get('target_low_price'))} - {fmt_num(market_context.get('target_high_price'))}
+Number of analysts: {market_context.get('num_analysts') or 'N/A'}
+Consensus rating (Yahoo Finance): {market_context.get('recommendation_key') or 'N/A'}
+
+Trailing P/E: {market_context.get('trailing_pe') or 'N/A'}
+Forward P/E: {market_context.get('forward_pe') or 'N/A'}
+PEG ratio: {market_context.get('peg_ratio') or 'N/A'}
+52-week range: {fmt_num(market_context.get('fifty_two_week_low'))} - {fmt_num(market_context.get('fifty_two_week_high'))}
+Beta: {market_context.get('beta') or 'N/A'}
+
+1-month price momentum: {fmt_pct(market_context.get('momentum_1mo'))}
+3-month price momentum: {fmt_pct(market_context.get('momentum_3mo'))}
+
+Recent news headlines:
+{news_lines}
+"""
+    return ai_summary(data_block, ANALYST_TEMPLATE)
 
 
 # -----------------------------
@@ -637,13 +765,12 @@ if ticker:
         st.table(pd.DataFrame(sens_rows))
 
     st.header("6. AI Analyst Report")
+    st.caption("Weighs the DCF alongside analyst consensus, valuation multiples, price momentum, and recent news — not the DCF alone.")
     if price_estimate is not None:
+        with st.spinner("Pulling analyst consensus, multiples, and recent news..."):
+            market_context = get_market_context(ticker)
         with st.spinner("Generating analyst report..."):
-            report = ai_summary(
-                f"Forecast:\n{forecast.to_string()}\n\nDCF intrinsic value per share: ${price_estimate:,.2f}\n"
-                f"Current market price: ${current_price:,.2f}",
-                instructions="Write a brief analyst-style verdict (buy/hold/sell reasoning) based on this DCF output, in 3-5 sentences.",
-            )
-        st.write(report)
+            report = build_analyst_report(ticker, forecast, price_estimate, current_price, market_context)
+        st.markdown(report)
     else:
         st.info("Analyst report skipped — DCF valuation was not computable above.")
