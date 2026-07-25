@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import re
+import time
 from bs4 import BeautifulSoup
 
 # -----------------------------
@@ -16,10 +17,11 @@ st.set_page_config(page_title="AI Stock Valuation Model", layout="wide")
 # (and add that file to .gitignore) or set it as an environment variable.
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", None)
 
-# SEC requires a descriptive User-Agent with contact info, or it will
-# rate-limit / block you. Replace with your real name + email.
+# SEC REQUIRES a descriptive User-Agent with a real name + working email.
+# Generic/placeholder agents get rate-limited or blocked much more aggressively.
+# >>> Replace the line below with your actual name and email before deploying. <<<
 SEC_HEADERS = {
-    "User-Agent": "AI Stock Valuation App contact@example.com",
+    "User-Agent": "AI Stock Valuation App - Replace With Your Name your_email@example.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "www.sec.gov",
 }
@@ -29,12 +31,12 @@ SEC_DATA_HEADERS = {**SEC_HEADERS, "Host": "data.sec.gov"}
 # -----------------------------
 # FREE AI (Groq Llama-3 / GPT-OSS)
 # -----------------------------
-def ai_summary(text, instructions="Summarize this 10-K section and extract growth drivers and risks."):
+def ai_summary(text, instructions, temperature=0.2):
     if not GROQ_API_KEY:
         return "⚠️ No GROQ_API_KEY found in st.secrets. Add one to .streamlit/secrets.toml to enable AI summaries."
 
     if not text or len(text.strip()) < 50:
-        return "⚠️ No usable text was available to summarize (see warning above)."
+        return "⚠️ No usable text was available to summarize."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -42,20 +44,17 @@ def ai_summary(text, instructions="Summarize this 10-K section and extract growt
         "Content-Type": "application/json",
     }
 
-    # Keep the payload within a safe context size
-    text = text[:18000]
-
     data = {
         "model": "openai/gpt-oss-120b",
         "messages": [
-            {"role": "system", "content": "You are a financial analyst. Be concise and specific."},
+            {"role": "system", "content": "You are a precise financial analyst. Follow the requested output format exactly, every time, regardless of company."},
             {"role": "user", "content": f"{instructions}\n\n{text}"},
         ],
-        "temperature": 0.2,
+        "temperature": temperature,
     }
 
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=60)
+        r = requests.post(url, headers=headers, json=data, timeout=90)
         payload = r.json()
     except Exception as e:
         return f"Groq API request failed: {e}"
@@ -70,14 +69,46 @@ def ai_summary(text, instructions="Summarize this 10-K section and extract growt
 
 
 # -----------------------------
+# TICKER NORMALIZATION
+# -----------------------------
+def ticker_variants(ticker):
+    """SEC and Yahoo Finance don't always agree on share-class formatting
+    (e.g. BRK.B vs BRK-B). Try the raw ticker plus common variants."""
+    t = ticker.upper().strip()
+    variants = [t]
+    if "." in t:
+        variants.append(t.replace(".", "-"))
+    if "-" in t:
+        variants.append(t.replace("-", "."))
+    # de-dupe, preserve order
+    seen = set()
+    return [v for v in variants if not (v in seen or seen.add(v))]
+
+
+# -----------------------------
 # SEC 10-K FETCHER
 # -----------------------------
-@st.cache_data(ttl=60 * 60 * 24)  # ticker->CIK map rarely changes; refresh daily
+def _get_with_retry(url, headers, max_retries=3, timeout=30):
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(1.5 * (attempt + 1))  # backoff: 1.5s, 3s, 4.5s
+                continue
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Failed after {max_retries} attempts: {last_err}")
+
+
+@st.cache_data(ttl=60 * 60 * 24)
 def load_cik_map():
     """Build a ticker -> zero-padded CIK map straight from SEC, no local file needed."""
-    url = "https://www.sec.gov/files/company_tickers.json"
-    r = requests.get(url, headers=SEC_HEADERS, timeout=30)
-    r.raise_for_status()
+    r = _get_with_retry("https://www.sec.gov/files/company_tickers.json", SEC_HEADERS)
     data = r.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
@@ -87,16 +118,19 @@ def get_cik_from_ticker(ticker):
         cik_map = load_cik_map()
     except Exception as e:
         st.warning(f"Could not load SEC ticker list: {e}")
-        return None
-    return cik_map.get(ticker.upper())
+        return None, None
+
+    for variant in ticker_variants(ticker):
+        if variant in cik_map:
+            return cik_map[variant], variant
+    return None, None
 
 
 def _clean_filing_html(html):
-    """Strip tags/scripts/styles and collapse whitespace so the LLM gets readable text."""
+    """Strip tags/scripts/styles and collapse whitespace so downstream parsing
+    works on readable text instead of markup."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "table"]):
-        # Tables in 10-Ks are mostly financial statement grids that don't
-        # summarize well as flattened text; drop them and keep narrative text.
+    for tag in soup(["script", "style"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
     text = re.sub(r"\n\s*\n+", "\n\n", text)
@@ -104,21 +138,54 @@ def _clean_filing_html(html):
     return text.strip()
 
 
+# Canonical 10-K item headers we care about, in filing order.
+ITEM_PATTERNS = [
+    ("business", r"item\s+1\.?\s+business"),
+    ("risk_factors", r"item\s+1a\.?\s+risk\s+factors"),
+    ("properties", r"item\s+2\.?\s+properties"),
+    ("legal_proceedings", r"item\s+3\.?\s+legal\s+proceedings"),
+    ("mdna", r"item\s+7\.?\s+management.?s\s+discussion"),
+    ("market_risk", r"item\s+7a\.?\s+quantitative"),
+    ("financial_statements", r"item\s+8\.?\s+financial\s+statements"),
+]
+
+
+def extract_10k_sections(text, max_chars_per_section=4500):
+    """
+    Split a cleaned 10-K into its major Items by locating header text.
+    Returns a dict of section_name -> excerpt. Falls back gracefully if a
+    section can't be located (structure varies company to company).
+    """
+    lower = text.lower()
+    matches = []
+    for name, pattern in ITEM_PATTERNS:
+        m = re.search(pattern, lower)
+        if m:
+            matches.append((m.start(), name))
+    matches.sort()
+
+    sections = {}
+    for i, (start, name) in enumerate(matches):
+        end = matches[i + 1][0] if i + 1 < len(matches) else len(text)
+        excerpt = text[start:end].strip()
+        sections[name] = excerpt[:max_chars_per_section]
+
+    return sections
+
+
 @st.cache_data(ttl=60 * 60 * 6)
 def get_10k(ticker):
     """
-    Returns (clean_text, meta) where meta has filing date / URL for display,
-    or (None, error_message) on failure.
+    Returns (sections_dict, meta) on success, or (None, error_message) on failure.
+    sections_dict maps Item name -> text excerpt (see ITEM_PATTERNS).
     """
-    ticker = ticker.upper()
-    cik = get_cik_from_ticker(ticker)
+    cik, matched_ticker = get_cik_from_ticker(ticker)
     if cik is None:
-        return None, f"Ticker '{ticker}' not found in SEC's company list."
+        return None, f"Ticker '{ticker.upper()}' not found in SEC's company list (tried: {', '.join(ticker_variants(ticker))})."
 
     subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
-        r = requests.get(subs_url, headers=SEC_DATA_HEADERS, timeout=30)
-        r.raise_for_status()
+        r = _get_with_retry(subs_url, SEC_DATA_HEADERS)
         data = r.json()
     except Exception as e:
         return None, f"SEC submissions lookup failed: {e}"
@@ -129,32 +196,133 @@ def get_10k(ticker):
     primaries = recent.get("primaryDocument", [])
     dates = recent.get("filingDate", [])
 
+    filing_index = None
     for i, form in enumerate(forms):
         if form in ("10-K", "10-K/A"):
-            accession_nodash = accessions[i].replace("-", "")
-            primary_doc = primaries[i]
-            doc_url = (
-                f"https://www.sec.gov/Archives/edgar/data/"
-                f"{int(cik)}/{accession_nodash}/{primary_doc}"
-            )
+            filing_index = i
+            break
+
+    # Some companies' "recent" window doesn't include a 10-K (e.g. very
+    # frequent other filings). Check the older filings index as a fallback.
+    if filing_index is None:
+        older_files = data.get("filings", {}).get("files", [])
+        for f in older_files:
             try:
-                doc_resp = requests.get(doc_url, headers=SEC_HEADERS, timeout=30)
-                doc_resp.raise_for_status()
-            except Exception as e:
-                return None, f"Failed to download filing document: {e}"
+                older = _get_with_retry(
+                    f"https://data.sec.gov/submissions/{f['name']}", SEC_DATA_HEADERS
+                ).json()
+            except Exception:
+                continue
+            o_forms = older.get("form", [])
+            for i, form in enumerate(o_forms):
+                if form in ("10-K", "10-K/A"):
+                    forms, accessions, primaries, dates = (
+                        o_forms,
+                        older.get("accessionNumber", []),
+                        older.get("primaryDocument", []),
+                        older.get("filingDate", []),
+                    )
+                    filing_index = i
+                    break
+            if filing_index is not None:
+                break
 
-            clean_text = _clean_filing_html(doc_resp.text)
-            meta = {"form": form, "filed": dates[i], "url": doc_url}
-            return clean_text, meta
+    if filing_index is None:
+        return None, f"No 10-K or 10-K/A filing found for {matched_ticker} (CIK {cik})."
 
-    return None, f"No 10-K or 10-K/A filing found in recent filings for {ticker}."
+    accession_nodash = accessions[filing_index].replace("-", "")
+    primary_doc = primaries[filing_index]
+    doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_nodash}/{primary_doc}"
+
+    try:
+        doc_resp = _get_with_retry(doc_url, SEC_HEADERS, timeout=45)
+    except Exception as e:
+        return None, f"Failed to download filing document: {e}"
+
+    clean_text = _clean_filing_html(doc_resp.text)
+    sections = extract_10k_sections(clean_text)
+    meta = {
+        "form": forms[filing_index],
+        "filed": dates[filing_index],
+        "url": doc_url,
+        "matched_ticker": matched_ticker,
+        "full_text": clean_text,  # kept for fallback if section parsing misses everything
+    }
+    return sections, meta
 
 
 # -----------------------------
-# FINANCIALS
+# DETERMINISTIC FINANCIAL METRICS (no LLM involved — pulled straight from data)
 # -----------------------------
 @st.cache_data(ttl=60 * 60 * 6)
+def get_key_metrics(ticker):
+    """
+    Builds a fixed-schema table of core financials so the output shape is
+    identical for every ticker, with 'N/A' where a company doesn't report
+    a given line item. Returns (metrics_dict, ok_flag).
+    """
+    stock = yf.Ticker(ticker)
+    fields = [
+        "Revenue", "Net Income", "Gross Profit", "Operating Income",
+        "Operating Margin", "Net Margin", "EPS (Diluted)",
+        "Total Debt", "Cash & Equivalents", "Free Cash Flow",
+    ]
+    metrics = {f: "N/A" for f in fields}
+    ok = True
+
+    try:
+        income = stock.financials
+        cashflow = stock.cashflow
+        balance = stock.balance_sheet
+
+        if income is not None and not income.empty:
+            revenue = income.loc["Total Revenue"].iloc[0] if "Total Revenue" in income.index else None
+            net_income = income.loc["Net Income"].iloc[0] if "Net Income" in income.index else None
+            gross_profit = income.loc["Gross Profit"].iloc[0] if "Gross Profit" in income.index else None
+            op_income = income.loc["Operating Income"].iloc[0] if "Operating Income" in income.index else None
+
+            if revenue:
+                metrics["Revenue"] = f"${revenue:,.0f}"
+            if net_income is not None:
+                metrics["Net Income"] = f"${net_income:,.0f}"
+            if gross_profit is not None:
+                metrics["Gross Profit"] = f"${gross_profit:,.0f}"
+            if op_income is not None:
+                metrics["Operating Income"] = f"${op_income:,.0f}"
+            if revenue and op_income is not None:
+                metrics["Operating Margin"] = f"{op_income / revenue:.1%}"
+            if revenue and net_income is not None:
+                metrics["Net Margin"] = f"{net_income / revenue:.1%}"
+
+        eps = stock.info.get("trailingEps")
+        if eps:
+            metrics["EPS (Diluted)"] = f"${eps:.2f}"
+
+        if balance is not None and not balance.empty:
+            debt_fields = ["Total Debt", "Long Term Debt"]
+            for f in debt_fields:
+                if f in balance.index:
+                    metrics["Total Debt"] = f"${balance.loc[f].iloc[0]:,.0f}"
+                    break
+            cash_fields = ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]
+            for f in cash_fields:
+                if f in balance.index:
+                    metrics["Cash & Equivalents"] = f"${balance.loc[f].iloc[0]:,.0f}"
+                    break
+
+        if cashflow is not None and not cashflow.empty and "Free Cash Flow" in cashflow.index:
+            metrics["Free Cash Flow"] = f"${cashflow.loc['Free Cash Flow'].iloc[0]:,.0f}"
+
+    except Exception as e:
+        ok = False
+        st.warning(f"Some financial metrics unavailable: {e}")
+
+    return metrics, ok
+
+
+@st.cache_data(ttl=60 * 60 * 6)
 def get_financials(ticker):
+    """Historical revenue/margin series used for the forecast model."""
     stock = yf.Ticker(ticker)
     try:
         income = stock.financials
@@ -163,7 +331,7 @@ def get_financials(ticker):
         if "Total Revenue" not in income.index or "Operating Income" not in income.index:
             raise ValueError("Missing required financial fields")
 
-        revenue = income.loc["Total Revenue"].iloc[:4].values[::-1]  # oldest -> newest
+        revenue = income.loc["Total Revenue"].iloc[:4].values[::-1]
         op_income = income.loc["Operating Income"].iloc[:4].values[::-1]
         op_margin = np.divide(
             op_income, revenue, out=np.zeros_like(op_income, dtype=float), where=revenue != 0
@@ -180,7 +348,6 @@ def get_financials(ticker):
 
 
 def historical_growth_rate(financials, fallback=0.05, cap=0.30):
-    """CAGR from the revenue history we have, clamped to something sane."""
     revs = financials["Revenue"].values
     revs = revs[revs > 0]
     if len(revs) < 2:
@@ -203,7 +370,7 @@ def build_forecast(financials, growth_rate, years_out=5):
     for i in range(1, years_out + 1):
         rev = rev * (1 + growth_rate)
         op_income = rev * op_margin
-        fcf = op_income * 0.7  # rough FCF conversion assumption
+        fcf = op_income * 0.7
 
         years.append(datetime.datetime.now().year + i)
         revenues.append(rev)
@@ -220,12 +387,51 @@ def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
     discounted = [fcf / ((1 + discount_rate) ** (i + 1)) for i, fcf in enumerate(fcfs)]
 
     if discount_rate <= terminal_growth:
-        return None  # terminal value math breaks down; caller should handle
+        return None
 
     terminal_value = fcfs[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
     terminal_value_discounted = terminal_value / ((1 + discount_rate) ** len(fcfs))
 
     return sum(discounted) + terminal_value_discounted
+
+
+# -----------------------------
+# FIXED-TEMPLATE 10-K NARRATIVE
+# -----------------------------
+QUALITATIVE_TEMPLATE = """
+Using ONLY the filing excerpts below, fill in this exact markdown table. Keep the
+row order and labels EXACTLY as shown for every company, no matter what the filing
+covers. If the filing excerpts don't address a row, write "Not disclosed in excerpt"
+— do not omit rows and do not add extra rows.
+
+| Item | Summary |
+|---|---|
+| Core business description | |
+| Primary products/segments | |
+| Geographic footprint | |
+| Top 3 risk factors | |
+| Legal/regulatory matters | |
+| Management's outlook (from MD&A) | |
+| Notable concentration exposures (customers/suppliers) | |
+| Capital allocation notes (buybacks/dividends/debt, if mentioned) | |
+
+Filing excerpts:
+"""
+
+
+def build_qualitative_summary(sections, full_text_fallback):
+    if not sections:
+        # No Item headers were locatable — fall back to the first chunk of
+        # cleaned text so the model still has *something* to work with.
+        combined = full_text_fallback[:12000]
+    else:
+        parts = []
+        for name, _ in ITEM_PATTERNS:
+            if name in sections:
+                parts.append(f"--- {name.upper()} ---\n{sections[name]}")
+        combined = "\n\n".join(parts)[:16000]
+
+    return ai_summary(combined, QUALITATIVE_TEMPLATE)
 
 
 # -----------------------------
@@ -240,7 +446,7 @@ with st.sidebar:
     manual_growth = st.checkbox("Override revenue growth assumption")
     manual_growth_rate = st.slider("Revenue growth rate", -0.10, 0.40, 0.05, 0.01) if manual_growth else None
 
-ticker = st.text_input("Enter a stock ticker (AAPL, MSFT, TSLA):").strip()
+ticker = st.text_input("Enter a stock ticker (AAPL, MSFT, TSLA, BRK.B):").strip()
 
 if ticker:
     st.header("1. Market Data")
@@ -251,24 +457,29 @@ if ticker:
         st.stop()
     st.line_chart(hist["Close"])
 
-    st.header("2. Financial Data")
-    financials, financials_ok = get_financials(ticker)
-    st.write(financials)
+    st.header("2. Key Financial Metrics")
+    st.caption("Pulled directly from reported financial data — same fields shown for every company, regardless of what the 10-K narrative covers.")
+    metrics, metrics_ok = get_key_metrics(ticker)
+    st.table(pd.DataFrame(metrics.items(), columns=["Metric", "Value"]))
 
+    financials, financials_ok = get_financials(ticker)
     growth_rate = manual_growth_rate if manual_growth else historical_growth_rate(financials)
-    st.caption(f"Using revenue growth assumption: {growth_rate:.1%}"
+    st.caption(f"Forecast revenue growth assumption: {growth_rate:.1%}"
                + (" (manual override)" if manual_growth else " (derived from historical CAGR)"))
 
-    st.header("3. AI Summary of 10-K")
-    tenk_text, meta = get_10k(ticker)
-    if tenk_text is None:
-        st.warning(meta)  # meta holds the error message in this branch
-        summary = "Skipped — no 10-K text was available."
+    st.header("3. 10-K Qualitative Summary")
+    sections, meta = get_10k(ticker)
+    if sections is None:
+        st.warning(meta)
+        summary = None
     else:
-        st.caption(f"Source: {meta['form']} filed {meta['filed']} — [view filing]({meta['url']})")
+        st.caption(f"Source: {meta['form']} filed {meta['filed']} (matched as {meta['matched_ticker']}) — [view filing]({meta['url']})")
+        found = [name for name, _ in ITEM_PATTERNS if name in sections]
+        if not found:
+            st.info("Couldn't locate standard Item headers in this filing; summarizing from the start of the document instead.")
         with st.spinner("Summarizing 10-K..."):
-            summary = ai_summary(tenk_text)
-    st.write(summary)
+            summary = build_qualitative_summary(sections, meta["full_text"])
+        st.markdown(summary)
 
     st.header("4. 5-Year Forecast")
     forecast = build_forecast(financials, growth_rate)
@@ -278,6 +489,7 @@ if ticker:
     intrinsic = run_dcf(forecast, discount_rate, terminal_growth)
     shares = stock.info.get("sharesOutstanding")
 
+    price_estimate = None
     if intrinsic is None:
         st.error("Discount rate must be greater than terminal growth rate.")
     elif not shares:
@@ -302,12 +514,12 @@ if ticker:
         st.table(pd.DataFrame(sens_rows))
 
     st.header("6. AI Analyst Report")
-    if intrinsic is not None and shares:
+    if price_estimate is not None:
         with st.spinner("Generating analyst report..."):
             report = ai_summary(
                 f"Forecast:\n{forecast.to_string()}\n\nDCF intrinsic value per share: ${price_estimate:,.2f}\n"
                 f"Current market price: ${current_price:,.2f}",
-                instructions="Write a brief analyst-style verdict (buy/hold/sell reasoning) based on this DCF output.",
+                instructions="Write a brief analyst-style verdict (buy/hold/sell reasoning) based on this DCF output, in 3-5 sentences.",
             )
         st.write(report)
     else:
