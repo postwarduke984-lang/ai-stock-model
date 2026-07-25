@@ -486,6 +486,11 @@ if ticker:
     st.write(forecast)
 
     st.header("5. DCF Valuation")
+    st.caption(
+        "Simplified model: holds today's operating margin flat for 5 years, assumes free cash flow "
+        "is 70% of operating income, and applies a single terminal growth rate. Real valuations account "
+        "for margin trends, capex cycles, and buybacks/dilution — treat this as a rough anchor, not a price target."
+    )
     intrinsic = run_dcf(forecast, discount_rate, terminal_growth)
     shares = stock.info.get("sharesOutstanding")
 
@@ -496,12 +501,29 @@ if ticker:
         st.error("Shares outstanding unavailable for this ticker; can't compute per-share value.")
     else:
         price_estimate = intrinsic / shares
-        current_price = hist["Close"].iloc[-1]
-        upside = (price_estimate / current_price - 1) if current_price else None
+
+        # hist["Close"].iloc[-1] can be NaN if the most recent trading day's
+        # data is incomplete (common right after market open, or on gappy
+        # feeds). Fall back to the last non-NaN close, then to live quote
+        # fields from stock.info if the whole history is somehow empty.
+        valid_closes = hist["Close"].dropna()
+        if not valid_closes.empty:
+            current_price = valid_closes.iloc[-1]
+        else:
+            current_price = stock.info.get("currentPrice") or stock.info.get("regularMarketPrice")
+
+        upside = (
+            (price_estimate / current_price - 1)
+            if current_price and np.isfinite(current_price)
+            else None
+        )
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Estimated Intrinsic Value/Share", f"${price_estimate:,.2f}")
-        col2.metric("Current Price", f"${current_price:,.2f}")
+        col2.metric(
+            "Current Price",
+            f"${current_price:,.2f}" if current_price and np.isfinite(current_price) else "Unavailable",
+        )
         if upside is not None:
             col3.metric("Implied Upside/Downside", f"{upside:+.1%}")
 
