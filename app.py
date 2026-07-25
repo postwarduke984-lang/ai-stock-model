@@ -29,6 +29,142 @@ SEC_DATA_HEADERS = {**SEC_HEADERS, "Host": "data.sec.gov"}
 
 
 # -----------------------------
+# UI STYLING
+# -----------------------------
+def inject_custom_css():
+    st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        html, body, [class*="css"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        /* Section headers: more breathing room, subtle divider */
+        h1 { font-weight: 800 !important; letter-spacing: -0.02em; }
+        h2 {
+            font-weight: 700 !important;
+            letter-spacing: -0.01em;
+            margin-top: 2.2rem !important;
+            padding-bottom: 0.4rem;
+            border-bottom: 1px solid rgba(128,128,128,0.2);
+        }
+        h3 { font-weight: 600 !important; }
+
+        /* st.metric cards: bigger, bolder numbers with small uppercase labels,
+           similar to the big-stat tiles on etfrc.com */
+        div[data-testid="stMetric"] {
+            background: rgba(128,128,128,0.06);
+            border: 1px solid rgba(128,128,128,0.15);
+            border-radius: 12px;
+            padding: 1rem 1.2rem 0.8rem 1.2rem;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 2.1rem !important;
+            font-weight: 800 !important;
+            letter-spacing: -0.02em;
+        }
+        div[data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
+            font-weight: 600 !important;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            opacity: 0.65;
+        }
+
+        /* Verdict banner */
+        .verdict-banner {
+            border-radius: 14px;
+            padding: 1.4rem 1.6rem;
+            margin: 0.6rem 0 1.2rem 0;
+            text-align: center;
+        }
+        .verdict-label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            opacity: 0.75;
+            margin-bottom: 0.2rem;
+        }
+        .verdict-value {
+            font-size: 3rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            line-height: 1.1;
+        }
+
+        /* Tables: tighter, cleaner */
+        div[data-testid="stTable"] table { font-size: 0.9rem; }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+VERDICT_COLORS = {
+    "buy": {"bg": "rgba(34, 197, 94, 0.12)", "text": "#16a34a"},
+    "hold": {"bg": "rgba(234, 179, 8, 0.12)", "text": "#ca8a04"},
+    "sell": {"bg": "rgba(239, 68, 68, 0.12)", "text": "#dc2626"},
+}
+
+
+def render_verdict_banner(report_text):
+    """
+    Pulls the Buy/Hold/Sell call out of the report's '**Verdict: X**' line and
+    renders it as a large color-coded banner, then returns the report with
+    that line stripped (so it isn't shown twice).
+    """
+    match = re.search(r"\*\*Verdict:\s*(Buy|Hold|Sell)\*\*", report_text, re.IGNORECASE)
+    if not match:
+        return report_text  # couldn't parse a verdict — just show the report as-is
+
+    verdict = match.group(1).capitalize()
+    colors = VERDICT_COLORS.get(verdict.lower(), {"bg": "rgba(128,128,128,0.1)", "text": "inherit"})
+
+    st.markdown(f"""
+        <div class="verdict-banner" style="background:{colors['bg']};">
+            <div class="verdict-label">Analyst Verdict</div>
+            <div class="verdict-value" style="color:{colors['text']};">{verdict}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    return report_text[:match.start()] + report_text[match.end():]
+
+
+def format_large_currency(value):
+    """Compact currency formatting: $391.2B, $2.4M, $850.0K, or plain $ for small values."""
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    sign = "-" if value < 0 else ""
+    abs_val = abs(value)
+    if abs_val >= 1e12:
+        return f"{sign}${abs_val / 1e12:.2f}T"
+    if abs_val >= 1e9:
+        return f"{sign}${abs_val / 1e9:.2f}B"
+    if abs_val >= 1e6:
+        return f"{sign}${abs_val / 1e6:.2f}M"
+    if abs_val >= 1e3:
+        return f"{sign}${abs_val / 1e3:.1f}K"
+    return f"{sign}${abs_val:,.2f}"
+
+
+def format_large_number(value):
+    """Same compact scaling as format_large_currency but without a $ sign — for share counts etc."""
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    sign = "-" if value < 0 else ""
+    abs_val = abs(value)
+    if abs_val >= 1e12:
+        return f"{sign}{abs_val / 1e12:.2f}T"
+    if abs_val >= 1e9:
+        return f"{sign}{abs_val / 1e9:.2f}B"
+    if abs_val >= 1e6:
+        return f"{sign}{abs_val / 1e6:.2f}M"
+    if abs_val >= 1e3:
+        return f"{sign}{abs_val / 1e3:.1f}K"
+    return f"{sign}{abs_val:,.0f}"
+
+
+# -----------------------------
 # FREE AI (Groq Llama-3 / GPT-OSS)
 # -----------------------------
 def ai_summary(text, instructions, temperature=0.2):
@@ -282,13 +418,13 @@ def get_key_metrics(ticker):
             op_income = income.loc["Operating Income"].iloc[0] if "Operating Income" in income.index else None
 
             if revenue:
-                metrics["Revenue"] = f"${revenue:,.0f}"
+                metrics["Revenue"] = format_large_currency(revenue)
             if net_income is not None:
-                metrics["Net Income"] = f"${net_income:,.0f}"
+                metrics["Net Income"] = format_large_currency(net_income)
             if gross_profit is not None:
-                metrics["Gross Profit"] = f"${gross_profit:,.0f}"
+                metrics["Gross Profit"] = format_large_currency(gross_profit)
             if op_income is not None:
-                metrics["Operating Income"] = f"${op_income:,.0f}"
+                metrics["Operating Income"] = format_large_currency(op_income)
             if revenue and op_income is not None:
                 metrics["Operating Margin"] = f"{op_income / revenue:.1%}"
             if revenue and net_income is not None:
@@ -296,22 +432,22 @@ def get_key_metrics(ticker):
 
         eps = stock.info.get("trailingEps")
         if eps:
-            metrics["EPS (Diluted)"] = f"${eps:.2f}"
+            metrics["EPS (Diluted)"] = f"${eps:.2f}"  # per-share value — kept precise, not abbreviated
 
         if balance is not None and not balance.empty:
             debt_fields = ["Total Debt", "Long Term Debt"]
             for f in debt_fields:
                 if f in balance.index:
-                    metrics["Total Debt"] = f"${balance.loc[f].iloc[0]:,.0f}"
+                    metrics["Total Debt"] = format_large_currency(balance.loc[f].iloc[0])
                     break
             cash_fields = ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]
             for f in cash_fields:
                 if f in balance.index:
-                    metrics["Cash & Equivalents"] = f"${balance.loc[f].iloc[0]:,.0f}"
+                    metrics["Cash & Equivalents"] = format_large_currency(balance.loc[f].iloc[0])
                     break
 
         if cashflow is not None and not cashflow.empty and "Free Cash Flow" in cashflow.index:
-            metrics["Free Cash Flow"] = f"${cashflow.loc['Free Cash Flow'].iloc[0]:,.0f}"
+            metrics["Free Cash Flow"] = format_large_currency(cashflow.loc["Free Cash Flow"].iloc[0])
 
     except Exception as e:
         ok = False
@@ -630,6 +766,7 @@ Recent news headlines:
 # STREAMLIT UI
 # -----------------------------
 st.title("AI Stock Valuation Model (Free Version)")
+inject_custom_css()
 
 with st.sidebar:
     st.header("Assumptions")
@@ -685,7 +822,13 @@ if ticker:
 
     st.header("4. 5-Year Forecast")
     forecast = build_forecast(financials, growth_rate)
-    st.write(forecast)
+    forecast_display = pd.DataFrame({
+        "Year": forecast["Year"].astype(int),
+        "Revenue": forecast["Revenue"].apply(format_large_currency),
+        "Operating Income": forecast["Operating Income"].apply(format_large_currency),
+        "Free Cash Flow": forecast["FCF"].apply(format_large_currency),
+    })
+    st.table(forecast_display)
 
     st.header("5. DCF Valuation")
 
@@ -752,7 +895,7 @@ if ticker:
             with st.expander("Projected share count under the buyback assumption"):
                 share_table = pd.DataFrame({
                     "Year": forecast["Year"].values,
-                    "Projected Shares Outstanding": [f"{s:,.0f}" for s in shares_by_year],
+                    "Projected Shares Outstanding": [format_large_number(s) for s in shares_by_year],
                 })
                 st.table(share_table)
 
@@ -771,6 +914,7 @@ if ticker:
             market_context = get_market_context(ticker)
         with st.spinner("Generating analyst report..."):
             report = build_analyst_report(ticker, forecast, price_estimate, current_price, market_context)
-        st.markdown(report)
+        remaining_report = render_verdict_banner(report)
+        st.markdown(remaining_report)
     else:
         st.info("Analyst report skipped — DCF valuation was not computable above.")
