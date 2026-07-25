@@ -383,6 +383,7 @@ def build_forecast(financials, growth_rate, years_out=5):
 
 
 def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
+    """Total firm intrinsic value (no buyback adjustment) — kept for reference/sensitivity."""
     fcfs = forecast["FCF"].values
     discounted = [fcf / ((1 + discount_rate) ** (i + 1)) for i, fcf in enumerate(fcfs)]
 
@@ -393,6 +394,69 @@ def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
     terminal_value_discounted = terminal_value / ((1 + discount_rate) ** len(fcfs))
 
     return sum(discounted) + terminal_value_discounted
+
+
+@st.cache_data(ttl=60 * 60 * 6)
+def estimate_buyback_rate(ticker, cap=0.08):
+    """
+    Rough annual share-count reduction rate, estimated from last year's cash
+    spent on repurchases divided by market cap. This is a heuristic (actual
+    buyback price varies through the year) — good enough to anchor a default,
+    with a manual override always available in the UI.
+    Returns (rate, ok_flag).
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        cashflow = stock.cashflow
+        market_cap = stock.info.get("marketCap")
+
+        if cashflow is None or cashflow.empty or not market_cap:
+            return 0.0, False
+
+        repurchase_field = None
+        for candidate in ("Repurchase Of Capital Stock", "Repurchase Of Common Stock"):
+            if candidate in cashflow.index:
+                repurchase_field = candidate
+                break
+        if repurchase_field is None:
+            return 0.0, False
+
+        buyback_cash = abs(cashflow.loc[repurchase_field].iloc[0])
+        if not buyback_cash or not np.isfinite(buyback_cash):
+            return 0.0, False
+
+        rate = buyback_cash / market_cap
+        return float(np.clip(rate, 0.0, cap)), True
+
+    except Exception:
+        return 0.0, False
+
+
+def run_dcf_per_share(forecast, shares0, buyback_rate, discount_rate=0.10, terminal_growth=0.02):
+    """
+    DCF computed directly on a per-share basis, with the share count shrinking
+    each year at `buyback_rate`. This credits the value created when the same
+    total cash flow gets divided across fewer future shares — the effect a
+    plain firm-level DCF / today's-share-count misses entirely.
+    Returns (price_per_share, shares_by_year) or (None, None) if terminal math
+    is invalid.
+    """
+    if discount_rate <= terminal_growth:
+        return None, None
+
+    fcfs = forecast["FCF"].values
+    n = len(fcfs)
+    shares_by_year = [shares0 * ((1 - buyback_rate) ** (i + 1)) for i in range(n)]
+
+    per_share_fcf = [fcf / shares for fcf, shares in zip(fcfs, shares_by_year)]
+    discounted = [psf / ((1 + discount_rate) ** (i + 1)) for i, psf in enumerate(per_share_fcf)]
+
+    terminal_psf = per_share_fcf[-1] * (1 + terminal_growth)
+    terminal_value_per_share = terminal_psf / (discount_rate - terminal_growth)
+    terminal_discounted = terminal_value_per_share / ((1 + discount_rate) ** n)
+
+    price = sum(discounted) + terminal_discounted
+    return price, shares_by_year
 
 
 # -----------------------------
@@ -446,6 +510,16 @@ with st.sidebar:
     manual_growth = st.checkbox("Override revenue growth assumption")
     manual_growth_rate = st.slider("Revenue growth rate", -0.10, 0.40, 0.05, 0.01) if manual_growth else None
 
+    st.divider()
+    st.header("Share Buybacks")
+    model_buybacks = st.checkbox("Model share buybacks in the DCF", value=True)
+    manual_buyback = st.checkbox("Override buyback rate")
+    manual_buyback_pct = (
+        st.slider("Annual share count reduction (%)", 0.0, 8.0, 2.0, 0.5)
+        if manual_buyback else None
+    )
+    manual_buyback_rate = manual_buyback_pct / 100 if manual_buyback_pct is not None else None
+
 ticker = st.text_input("Enter a stock ticker (AAPL, MSFT, TSLA, BRK.B):").strip()
 
 if ticker:
@@ -486,22 +560,41 @@ if ticker:
     st.write(forecast)
 
     st.header("5. DCF Valuation")
+
+    shares = stock.info.get("sharesOutstanding")
+
+    if model_buybacks:
+        est_rate, buyback_ok = estimate_buyback_rate(ticker)
+        buyback_rate = manual_buyback_rate if manual_buyback else est_rate
+    else:
+        buyback_rate, buyback_ok = 0.0, True
+
     st.caption(
         "Simplified model: holds today's operating margin flat for 5 years, assumes free cash flow "
         "is 70% of operating income, and applies a single terminal growth rate. Real valuations account "
-        "for margin trends, capex cycles, and buybacks/dilution — treat this as a rough anchor, not a price target."
+        "for margin trends and capex cycles beyond this — treat this as a rough anchor, not a price target."
     )
-    intrinsic = run_dcf(forecast, discount_rate, terminal_growth)
-    shares = stock.info.get("sharesOutstanding")
 
-    price_estimate = None
-    if intrinsic is None:
-        st.error("Discount rate must be greater than terminal growth rate.")
-    elif not shares:
-        st.error("Shares outstanding unavailable for this ticker; can't compute per-share value.")
+    if model_buybacks:
+        source_note = "manual override" if manual_buyback else (
+            "estimated from last year's buyback spend ÷ market cap" if buyback_ok else "no buyback data found — defaulted to 0%"
+        )
+        st.caption(f"Buyback assumption: share count shrinks {buyback_rate:.1%}/year ({source_note}).")
     else:
-        price_estimate = intrinsic / shares
+        st.caption("Buyback modeling is off — share count held constant, as in a plain textbook DCF.")
 
+    if not shares:
+        st.error("Shares outstanding unavailable for this ticker; can't compute per-share value.")
+        price_estimate, shares_by_year = None, None
+    else:
+        price_estimate, shares_by_year = run_dcf_per_share(
+            forecast, shares, buyback_rate, discount_rate, terminal_growth
+        )
+
+    if price_estimate is None and shares:
+        st.error("Discount rate must be greater than terminal growth rate.")
+
+    if price_estimate is not None:
         # hist["Close"].iloc[-1] can be NaN if the most recent trading day's
         # data is incomplete (common right after market open, or on gappy
         # feeds). Fall back to the last non-NaN close, then to live quote
@@ -527,12 +620,20 @@ if ticker:
         if upside is not None:
             col3.metric("Implied Upside/Downside", f"{upside:+.1%}")
 
+        if model_buybacks and buyback_rate > 0 and shares_by_year:
+            with st.expander("Projected share count under the buyback assumption"):
+                share_table = pd.DataFrame({
+                    "Year": forecast["Year"].values,
+                    "Projected Shares Outstanding": [f"{s:,.0f}" for s in shares_by_year],
+                })
+                st.table(share_table)
+
         st.subheader("Sensitivity: intrinsic value/share by discount rate")
         rates = [discount_rate + d for d in (-0.02, -0.01, 0, 0.01, 0.02) if discount_rate + d > terminal_growth]
         sens_rows = []
         for r in rates:
-            iv = run_dcf(forecast, r, terminal_growth)
-            sens_rows.append({"Discount Rate": f"{r:.1%}", "Value/Share": f"${iv / shares:,.2f}"})
+            iv, _ = run_dcf_per_share(forecast, shares, buyback_rate, r, terminal_growth)
+            sens_rows.append({"Discount Rate": f"{r:.1%}", "Value/Share": f"${iv:,.2f}"})
         st.table(pd.DataFrame(sens_rows))
 
     st.header("6. AI Analyst Report")
