@@ -164,6 +164,23 @@ def format_large_number(value):
     return f"{sign}{abs_val:,.0f}"
 
 
+def safe_num(value, default):
+    """
+    A plain `x or default` does NOT protect against NaN — float('nan') is
+    truthy in Python, so a NaN value from yfinance sails straight through
+    and silently poisons every downstream calculation (this was the actual
+    cause of the $nan DCF output). Use this everywhere a numeric field from
+    yfinance needs a fallback.
+    """
+    try:
+        if value is None:
+            return default
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
 # -----------------------------
 # FREE AI (Groq Llama-3 / GPT-OSS)
 # -----------------------------
@@ -603,7 +620,7 @@ def estimate_wacc(ticker):
         income = stock.financials
         balance = stock.balance_sheet
 
-        beta = info.get("beta") or 1.0
+        beta = safe_num(info.get("beta"), 1.0)
         details["beta"] = beta
         cost_of_equity = risk_free + beta * ERP
         details["cost_of_equity"] = cost_of_equity
@@ -612,11 +629,11 @@ def estimate_wacc(ticker):
         if balance is not None and not balance.empty:
             for f in ("Total Debt", "Long Term Debt"):
                 if f in balance.index:
-                    total_debt = float(balance.loc[f].iloc[0])
+                    total_debt = safe_num(balance.loc[f].iloc[0], 0.0)
                     break
             for f in ("Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"):
                 if f in balance.index:
-                    cash = float(balance.loc[f].iloc[0])
+                    cash = safe_num(balance.loc[f].iloc[0], 0.0)
                     break
         details["total_debt"] = total_debt
         details["cash"] = cash
@@ -624,18 +641,18 @@ def estimate_wacc(ticker):
         tax_rate = 0.21
         if income is not None and not income.empty:
             if "Tax Provision" in income.index and "Pretax Income" in income.index:
-                pretax = income.loc["Pretax Income"].iloc[0]
-                tax = income.loc["Tax Provision"].iloc[0]
-                if pretax and np.isfinite(pretax / pretax if pretax else np.nan):
-                    if pretax != 0:
-                        tax_rate = float(np.clip(tax / pretax, 0.0, 0.35))
+                pretax = safe_num(income.loc["Pretax Income"].iloc[0], None)
+                tax = safe_num(income.loc["Tax Provision"].iloc[0], None)
+                if pretax and tax is not None and pretax != 0:
+                    tax_rate = float(np.clip(tax / pretax, 0.0, 0.35))
         details["tax_rate"] = tax_rate
 
         interest_expense = None
         if income is not None and not income.empty:
             for f in ("Interest Expense", "Interest Expense Non Operating"):
                 if f in income.index:
-                    interest_expense = abs(float(income.loc[f].iloc[0]))
+                    val = safe_num(income.loc[f].iloc[0], None)
+                    interest_expense = abs(val) if val is not None else None
                     break
 
         if interest_expense and total_debt > 0:
@@ -644,7 +661,7 @@ def estimate_wacc(ticker):
             cost_of_debt = risk_free + 0.015  # generic credit spread fallback
         details["cost_of_debt"] = cost_of_debt
 
-        market_cap = info.get("marketCap") or 0.0
+        market_cap = safe_num(info.get("marketCap"), 0.0)
         total_capital = market_cap + total_debt
         weight_equity = market_cap / total_capital if total_capital > 0 else 1.0
         weight_debt = 1 - weight_equity
@@ -652,11 +669,15 @@ def estimate_wacc(ticker):
         details["weight_debt"] = weight_debt
 
         wacc = weight_equity * cost_of_equity + weight_debt * cost_of_debt * (1 - tax_rate)
+        if not np.isfinite(wacc):
+            raise ValueError("WACC computation produced a non-finite result")
         wacc = float(np.clip(wacc, 0.04, 0.20))
         return wacc, details
 
     except Exception:
         details["ok"] = False
+        details["beta"] = details.get("beta") or 1.0
+        details["cost_of_debt"] = details.get("cost_of_debt") or (risk_free + 0.015)
         return 0.09, details
 
 
@@ -711,7 +732,7 @@ def estimate_buyback_rate(ticker, cap=0.08, years=3):
     try:
         stock = yf.Ticker(ticker)
         cashflow = stock.cashflow
-        market_cap = stock.info.get("marketCap")
+        market_cap = safe_num(stock.info.get("marketCap"), None)
 
         if cashflow is None or cashflow.empty or not market_cap:
             return 0.0, False
@@ -1040,7 +1061,7 @@ if ticker:
         "actual net cash/debt position, divided by today's share count."
     )
 
-    shares = stock.info.get("sharesOutstanding")
+    shares = safe_num(stock.info.get("sharesOutstanding"), None)
     net_cash = wacc_details["cash"] - wacc_details["total_debt"]
 
     price_estimate = None
@@ -1056,9 +1077,9 @@ if ticker:
     if price_estimate is not None:
         valid_closes = hist["Close"].dropna()
         if not valid_closes.empty:
-            current_price = valid_closes.iloc[-1]
+            current_price = float(valid_closes.iloc[-1])
         else:
-            current_price = stock.info.get("currentPrice") or stock.info.get("regularMarketPrice")
+            current_price = safe_num(stock.info.get("currentPrice"), None) or safe_num(stock.info.get("regularMarketPrice"), None)
 
         upside = (
             (price_estimate / current_price - 1)
