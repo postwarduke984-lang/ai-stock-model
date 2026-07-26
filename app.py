@@ -495,6 +495,44 @@ def historical_growth_rate(financials, fallback=0.05, cap=0.30):
     return float(np.clip(cagr, -cap, cap))
 
 
+@st.cache_data(ttl=60 * 60 * 6)
+def estimate_growth_rate(ticker, _financials_tuple):
+    """
+    Blends backward-looking historical CAGR with Yahoo Finance's forward-looking
+    analyst growth estimates ('research reports' consensus, effectively) so the
+    forecast isn't purely extrapolating a stagnant or unusually hot recent stretch.
+    _financials_tuple is a hashable (tuple) version of the revenue series, needed
+    because st.cache_data can't hash a DataFrame directly.
+    Returns (blended_rate, historical_rate, analyst_rate_or_None).
+    """
+    revs = np.array(_financials_tuple)
+    revs = revs[revs > 0]
+    if len(revs) >= 2:
+        periods = len(revs) - 1
+        hist_rate = (revs[-1] / revs[0]) ** (1 / periods) - 1
+        hist_rate = float(np.clip(hist_rate, -0.30, 0.30)) if np.isfinite(hist_rate) else 0.05
+    else:
+        hist_rate = 0.05
+
+    analyst_rate = None
+    try:
+        info = yf.Ticker(ticker).info or {}
+        # revenueGrowth is Yahoo's most recent yoy figure, informed by analyst
+        # models — a reasonable stand-in for "what research reports expect."
+        candidate = info.get("revenueGrowth")
+        if candidate is not None and np.isfinite(candidate):
+            analyst_rate = float(np.clip(candidate, -0.30, 0.50))
+    except Exception:
+        pass
+
+    if analyst_rate is not None:
+        blended = 0.5 * hist_rate + 0.5 * analyst_rate
+    else:
+        blended = hist_rate
+
+    return float(np.clip(blended, -0.20, 0.40)), hist_rate, analyst_rate
+
+
 # -----------------------------
 # FORECAST & DCF
 # -----------------------------
@@ -518,27 +556,156 @@ def build_forecast(financials, growth_rate, years_out=5):
     )
 
 
-def run_dcf(forecast, discount_rate=0.10, terminal_growth=0.02):
-    """Total firm intrinsic value (no buyback adjustment) — kept for reference/sensitivity."""
-    fcfs = forecast["FCF"].values
-    discounted = [fcf / ((1 + discount_rate) ** (i + 1)) for i, fcf in enumerate(fcfs)]
-
-    if discount_rate <= terminal_growth:
-        return None
-
-    terminal_value = fcfs[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-    terminal_value_discounted = terminal_value / ((1 + discount_rate) ** len(fcfs))
-
-    return sum(discounted) + terminal_value_discounted
+@st.cache_data(ttl=60 * 60 * 24)
+def get_risk_free_rate(default=0.04):
+    """10-year US Treasury yield (^TNX) as a risk-free rate proxy for CAPM."""
+    try:
+        hist = yf.Ticker("^TNX").history(period="5d")
+        if hist.empty:
+            return default, False
+        value = float(hist["Close"].dropna().iloc[-1])
+        # Yahoo occasionally reports ^TNX scaled by 10 depending on feed version.
+        rate = value / 100 if value < 1 else (value / 10 / 100 if value > 30 else value / 100)
+        return float(np.clip(rate, 0.01, 0.10)), True
+    except Exception:
+        return default, False
 
 
 @st.cache_data(ttl=60 * 60 * 6)
-def estimate_buyback_rate(ticker, cap=0.08):
+def estimate_wacc(ticker):
     """
-    Rough annual share-count reduction rate, estimated from last year's cash
-    spent on repurchases divided by market cap. This is a heuristic (actual
-    buyback price varies through the year) — good enough to anchor a default,
-    with a manual override always available in the UI.
+    CAPM-based, company-specific discount rate — no manual guessing required.
+    cost_of_equity = risk_free_rate + beta * equity_risk_premium
+    cost_of_debt   = interest expense / total debt (after-tax), with a spread-based fallback
+    WACC = weight_equity * cost_of_equity + weight_debt * cost_of_debt_after_tax
+    Returns (wacc, details_dict). Falls back to a generic 9% if data is too sparse.
+    """
+    ERP = 0.045  # long-run US equity risk premium assumption (commonly cited ~4-5%)
+    risk_free, rf_ok = get_risk_free_rate()
+
+    details = {
+        "risk_free_rate": risk_free,
+        "equity_risk_premium": ERP,
+        "beta": None,
+        "cost_of_equity": None,
+        "cost_of_debt": None,
+        "tax_rate": 0.21,
+        "total_debt": 0.0,
+        "cash": 0.0,
+        "weight_equity": 1.0,
+        "weight_debt": 0.0,
+        "ok": True,
+    }
+
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+        income = stock.financials
+        balance = stock.balance_sheet
+
+        beta = info.get("beta") or 1.0
+        details["beta"] = beta
+        cost_of_equity = risk_free + beta * ERP
+        details["cost_of_equity"] = cost_of_equity
+
+        total_debt, cash = 0.0, 0.0
+        if balance is not None and not balance.empty:
+            for f in ("Total Debt", "Long Term Debt"):
+                if f in balance.index:
+                    total_debt = float(balance.loc[f].iloc[0])
+                    break
+            for f in ("Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"):
+                if f in balance.index:
+                    cash = float(balance.loc[f].iloc[0])
+                    break
+        details["total_debt"] = total_debt
+        details["cash"] = cash
+
+        tax_rate = 0.21
+        if income is not None and not income.empty:
+            if "Tax Provision" in income.index and "Pretax Income" in income.index:
+                pretax = income.loc["Pretax Income"].iloc[0]
+                tax = income.loc["Tax Provision"].iloc[0]
+                if pretax and np.isfinite(pretax / pretax if pretax else np.nan):
+                    if pretax != 0:
+                        tax_rate = float(np.clip(tax / pretax, 0.0, 0.35))
+        details["tax_rate"] = tax_rate
+
+        interest_expense = None
+        if income is not None and not income.empty:
+            for f in ("Interest Expense", "Interest Expense Non Operating"):
+                if f in income.index:
+                    interest_expense = abs(float(income.loc[f].iloc[0]))
+                    break
+
+        if interest_expense and total_debt > 0:
+            cost_of_debt = interest_expense / total_debt
+        else:
+            cost_of_debt = risk_free + 0.015  # generic credit spread fallback
+        details["cost_of_debt"] = cost_of_debt
+
+        market_cap = info.get("marketCap") or 0.0
+        total_capital = market_cap + total_debt
+        weight_equity = market_cap / total_capital if total_capital > 0 else 1.0
+        weight_debt = 1 - weight_equity
+        details["weight_equity"] = weight_equity
+        details["weight_debt"] = weight_debt
+
+        wacc = weight_equity * cost_of_equity + weight_debt * cost_of_debt * (1 - tax_rate)
+        wacc = float(np.clip(wacc, 0.04, 0.20))
+        return wacc, details
+
+    except Exception:
+        details["ok"] = False
+        return 0.09, details
+
+
+def estimate_terminal_growth(risk_free_rate):
+    """
+    Anchors terminal growth to the macro environment (roughly: long-run real
+    growth ≈ risk-free rate minus an inflation/real-rate spread) rather than
+    an arbitrary fixed 2%. Clipped to a conservative 1-3% band — no company
+    should be assumed to out-grow the broader economy forever.
+    """
+    return float(np.clip(risk_free_rate - 0.02, 0.01, 0.03))
+
+
+def run_dcf_standard(forecast, shares0, net_cash, discount_rate=0.10, terminal_growth=0.02):
+    """
+    Standard textbook DCF: discount firm-level unlevered FCF at WACC, add a
+    Gordon-growth terminal value, sum to Enterprise Value, then bridge to
+    Equity Value by adding net cash (or subtracting net debt if negative),
+    and divide by TODAY's share count. This is the conventional structure —
+    no share-count projection tricks, no double-counting of buyback value
+    (that value is already embedded in the FCF the company generates).
+    Returns (price_per_share, enterprise_value, equity_value) or (None, None, None).
+    """
+    if discount_rate <= terminal_growth:
+        return None, None, None
+
+    fcfs = forecast["FCF"].values
+    n = len(fcfs)
+    discounted = [fcf / ((1 + discount_rate) ** (i + 1)) for i, fcf in enumerate(fcfs)]
+
+    terminal_value = fcfs[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    terminal_value_discounted = terminal_value / ((1 + discount_rate) ** n)
+
+    enterprise_value = sum(discounted) + terminal_value_discounted
+    equity_value = enterprise_value + net_cash  # net_cash negative = net debt, naturally subtracts
+
+    price_per_share = equity_value / shares0
+    return price_per_share, enterprise_value, equity_value
+
+
+@st.cache_data(ttl=60 * 60 * 6)
+def estimate_buyback_rate(ticker, cap=0.08, years=3):
+    """
+    Annual share-count reduction rate, estimated from the average of up to the
+    last `years` of cash spent on repurchases divided by current market cap.
+    Averaging smooths out lumpy, one-off repurchase spikes. This informs the
+    illustrative buyback scenario below — it does not feed the standard DCF
+    price (which already captures the value of all future cash use, buybacks
+    included, via the Enterprise->Equity bridge).
     Returns (rate, ok_flag).
     """
     try:
@@ -557,25 +724,26 @@ def estimate_buyback_rate(ticker, cap=0.08):
         if repurchase_field is None:
             return 0.0, False
 
-        buyback_cash = abs(cashflow.loc[repurchase_field].iloc[0])
-        if not buyback_cash or not np.isfinite(buyback_cash):
+        series = cashflow.loc[repurchase_field].iloc[:years].abs()
+        series = series[np.isfinite(series)]
+        if series.empty:
             return 0.0, False
 
-        rate = buyback_cash / market_cap
+        avg_buyback_cash = series.mean()
+        rate = avg_buyback_cash / market_cap
         return float(np.clip(rate, 0.0, cap)), True
 
     except Exception:
         return 0.0, False
 
 
-def run_dcf_per_share(forecast, shares0, buyback_rate, discount_rate=0.10, terminal_growth=0.02):
+def run_dcf_buyback_illustrative(forecast, shares0, buyback_rate, discount_rate=0.10, terminal_growth=0.02):
     """
-    DCF computed directly on a per-share basis, with the share count shrinking
-    each year at `buyback_rate`. This credits the value created when the same
-    total cash flow gets divided across fewer future shares — the effect a
-    plain firm-level DCF / today's-share-count misses entirely.
-    Returns (price_per_share, shares_by_year) or (None, None) if terminal math
-    is invalid.
+    Secondary, illustrative view: shows how per-share value compounds if the
+    company's cash generation is channeled specifically into shrinking the
+    share count at `buyback_rate`/year, rather than the standard assumption
+    that all FCF accrues evenly to today's shareholders. Useful as a sense of
+    upside from continued aggressive buybacks — not the headline number.
     """
     if discount_rate <= terminal_growth:
         return None, None
@@ -769,21 +937,12 @@ st.title("AI Stock Valuation Model (Free Version)")
 inject_custom_css()
 
 with st.sidebar:
-    st.header("Assumptions")
-    discount_rate = st.slider("Discount rate (WACC)", 0.04, 0.20, 0.10, 0.01)
-    terminal_growth = st.slider("Terminal growth rate", 0.0, 0.05, 0.02, 0.005)
-    manual_growth = st.checkbox("Override revenue growth assumption")
-    manual_growth_rate = st.slider("Revenue growth rate", -0.10, 0.40, 0.05, 0.01) if manual_growth else None
-
-    st.divider()
-    st.header("Share Buybacks")
-    model_buybacks = st.checkbox("Model share buybacks in the DCF", value=True)
-    manual_buyback = st.checkbox("Override buyback rate")
-    manual_buyback_pct = (
-        st.slider("Annual share count reduction (%)", 0.0, 8.0, 2.0, 0.5)
-        if manual_buyback else None
+    st.header("How assumptions work")
+    st.caption(
+        "Discount rate, growth rate, and terminal growth are calculated automatically per "
+        "company from its own financials, capital structure, and analyst estimates. "
+        "Expand 'Advanced overrides' below the forecast if you want to test different scenarios."
     )
-    manual_buyback_rate = manual_buyback_pct / 100 if manual_buyback_pct is not None else None
 
 ticker = st.text_input("Enter a stock ticker (AAPL, MSFT, TSLA, BRK.B):").strip()
 
@@ -802,9 +961,53 @@ if ticker:
     st.table(pd.DataFrame(metrics.items(), columns=["Metric", "Value"]))
 
     financials, financials_ok = get_financials(ticker)
-    growth_rate = manual_growth_rate if manual_growth else historical_growth_rate(financials)
-    st.caption(f"Forecast revenue growth assumption: {growth_rate:.1%}"
-               + (" (manual override)" if manual_growth else " (derived from historical CAGR)"))
+
+    # --- Auto-calculated assumptions, per company ---
+    wacc_auto, wacc_details = estimate_wacc(ticker)
+    terminal_growth_auto = estimate_terminal_growth(wacc_details["risk_free_rate"])
+    growth_auto, growth_hist, growth_analyst = estimate_growth_rate(ticker, tuple(financials["Revenue"].values))
+    buyback_auto, buyback_ok = estimate_buyback_rate(ticker)
+
+    with st.expander("⚙️ Advanced overrides (defaults are auto-calculated for this company)"):
+        st.caption(
+            f"Auto WACC: {wacc_auto:.1%}  (β={wacc_details['beta']:.2f}, "
+            f"risk-free={wacc_details['risk_free_rate']:.1%}, "
+            f"cost of debt={wacc_details['cost_of_debt']:.1%}, "
+            f"equity/debt weight={wacc_details['weight_equity']:.0%}/{wacc_details['weight_debt']:.0%})"
+        )
+        override_wacc = st.checkbox("Override discount rate (WACC)", key=f"wacc_ovr_{ticker}")
+        discount_rate = (
+            st.slider("Discount rate (WACC)", 0.04, 0.20, float(round(wacc_auto, 2)), 0.01, key=f"wacc_{ticker}")
+            if override_wacc else wacc_auto
+        )
+
+        st.caption(f"Auto terminal growth: {terminal_growth_auto:.1%} (anchored to the risk-free rate, capped at 1–3%)")
+        override_terminal = st.checkbox("Override terminal growth rate", key=f"term_ovr_{ticker}")
+        terminal_growth = (
+            st.slider("Terminal growth rate", 0.0, 0.05, float(round(terminal_growth_auto, 3)), 0.005, key=f"term_{ticker}")
+            if override_terminal else terminal_growth_auto
+        )
+
+        analyst_note = f"{growth_analyst:.1%} analyst estimate" if growth_analyst is not None else "no analyst estimate found"
+        st.caption(f"Auto revenue growth: {growth_auto:.1%}  (blend of {growth_hist:.1%} historical CAGR + {analyst_note})")
+        override_growth = st.checkbox("Override revenue growth", key=f"growth_ovr_{ticker}")
+        growth_rate = (
+            st.slider("Revenue growth rate", -0.10, 0.40, float(round(growth_auto, 2)), 0.01, key=f"growth_{ticker}")
+            if override_growth else growth_auto
+        )
+
+        buyback_note = "estimated from 3-year average buyback spend ÷ market cap" if buyback_ok else "no buyback data found, defaulted to 0%"
+        st.caption(f"Auto buyback rate (illustrative only, see below): {buyback_auto:.1%}/year ({buyback_note})")
+        override_buyback = st.checkbox("Override buyback rate", key=f"buyback_ovr_{ticker}")
+        buyback_rate = (
+            st.slider("Annual share count reduction (%)", 0.0, 8.0, float(round(buyback_auto * 100, 1)), 0.5, key=f"buyback_{ticker}") / 100
+            if override_buyback else buyback_auto
+        )
+
+    st.caption(
+        f"Forecast assumptions in use — growth: {growth_rate:.1%} · WACC: {discount_rate:.1%} · "
+        f"terminal growth: {terminal_growth:.1%}"
+    )
 
     st.header("3. 10-K Qualitative Summary")
     sections, meta = get_10k(ticker)
@@ -831,45 +1034,26 @@ if ticker:
     st.table(forecast_display)
 
     st.header("5. DCF Valuation")
-
-    shares = stock.info.get("sharesOutstanding")
-
-    if model_buybacks:
-        est_rate, buyback_ok = estimate_buyback_rate(ticker)
-        buyback_rate = manual_buyback_rate if manual_buyback else est_rate
-    else:
-        buyback_rate, buyback_ok = 0.0, True
-
     st.caption(
-        "Simplified model: holds today's operating margin flat for 5 years, assumes free cash flow "
-        "is 70% of operating income, and applies a single terminal growth rate. Real valuations account "
-        "for margin trends and capex cycles beyond this — treat this as a rough anchor, not a price target."
+        "Standard DCF: unlevered free cash flow discounted at WACC, summed with a Gordon-growth "
+        "terminal value to get Enterprise Value, then bridged to Equity Value using the company's "
+        "actual net cash/debt position, divided by today's share count."
     )
 
-    if model_buybacks:
-        source_note = "manual override" if manual_buyback else (
-            "estimated from last year's buyback spend ÷ market cap" if buyback_ok else "no buyback data found — defaulted to 0%"
-        )
-        st.caption(f"Buyback assumption: share count shrinks {buyback_rate:.1%}/year ({source_note}).")
-    else:
-        st.caption("Buyback modeling is off — share count held constant, as in a plain textbook DCF.")
+    shares = stock.info.get("sharesOutstanding")
+    net_cash = wacc_details["cash"] - wacc_details["total_debt"]
 
+    price_estimate = None
     if not shares:
         st.error("Shares outstanding unavailable for this ticker; can't compute per-share value.")
-        price_estimate, shares_by_year = None, None
     else:
-        price_estimate, shares_by_year = run_dcf_per_share(
-            forecast, shares, buyback_rate, discount_rate, terminal_growth
+        price_estimate, enterprise_value, equity_value = run_dcf_standard(
+            forecast, shares, net_cash, discount_rate, terminal_growth
         )
-
-    if price_estimate is None and shares:
-        st.error("Discount rate must be greater than terminal growth rate.")
+        if price_estimate is None:
+            st.error("Discount rate must be greater than terminal growth rate.")
 
     if price_estimate is not None:
-        # hist["Close"].iloc[-1] can be NaN if the most recent trading day's
-        # data is incomplete (common right after market open, or on gappy
-        # feeds). Fall back to the last non-NaN close, then to live quote
-        # fields from stock.info if the whole history is somehow empty.
         valid_closes = hist["Close"].dropna()
         if not valid_closes.empty:
             current_price = valid_closes.iloc[-1]
@@ -891,21 +1075,31 @@ if ticker:
         if upside is not None:
             col3.metric("Implied Upside/Downside", f"{upside:+.1%}")
 
-        if model_buybacks and buyback_rate > 0 and shares_by_year:
-            with st.expander("Projected share count under the buyback assumption"):
-                share_table = pd.DataFrame({
-                    "Year": forecast["Year"].values,
-                    "Projected Shares Outstanding": [format_large_number(s) for s in shares_by_year],
-                })
-                st.table(share_table)
+        with st.expander("Enterprise → Equity bridge"):
+            st.write(f"Enterprise Value: {format_large_currency(enterprise_value)}")
+            st.write(f"Net cash (cash − total debt): {format_large_currency(net_cash)}")
+            st.write(f"Equity Value: {format_large_currency(equity_value)}")
 
         st.subheader("Sensitivity: intrinsic value/share by discount rate")
         rates = [discount_rate + d for d in (-0.02, -0.01, 0, 0.01, 0.02) if discount_rate + d > terminal_growth]
         sens_rows = []
         for r in rates:
-            iv, _ = run_dcf_per_share(forecast, shares, buyback_rate, r, terminal_growth)
+            iv, _, _ = run_dcf_standard(forecast, shares, net_cash, r, terminal_growth)
             sens_rows.append({"Discount Rate": f"{r:.1%}", "Value/Share": f"${iv:,.2f}"})
         st.table(pd.DataFrame(sens_rows))
+
+        if buyback_rate > 0:
+            illustrative_price, _ = run_dcf_buyback_illustrative(
+                forecast, shares, buyback_rate, discount_rate, terminal_growth
+            )
+            with st.expander("📈 Illustrative: value if buybacks keep shrinking the share count"):
+                st.caption(
+                    "Not part of the standard DCF above (that already values all future cash use "
+                    "through the Enterprise → Equity bridge). This shows, for context only, what "
+                    "per-share value looks like if the company keeps repurchasing shares at its "
+                    "recent rate and you credit that shrinking share count directly."
+                )
+                st.metric("Illustrative Value/Share (buybacks continue)", f"${illustrative_price:,.2f}")
 
     st.header("6. AI Analyst Report")
     st.caption("Weighs the DCF alongside analyst consensus, valuation multiples, price momentum, and recent news — not the DCF alone.")
